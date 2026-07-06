@@ -4,6 +4,12 @@
 
 SeisSeeker is a research-style Python package for seismic array detection and simple location. When updating the repo, prefer practical usability improvements over broad refactors unless the task clearly calls for deeper algorithm work.
 
+Treat the codebase as research-grade software:
+
+- prioritize correctness, traceability, and clear assumptions over premature abstraction
+- preserve scientifically meaningful behavior unless a change is deliberate and documented
+- make it easy to inspect algorithm choices, units, and data expectations
+
 ## Main Entry Points
 
 - `SeisSeeker/processing/detection.py`
@@ -47,3 +53,12 @@ Keep the README usage-first:
 - what limitations matter in practice
 
 Avoid turning the README into a paper summary unless the user explicitly asks for that.
+
+## Development Workflow
+
+Use a TDD workflow where practical:
+
+- add or update tests before changing behavior when the expected behavior is clear
+- keep tests small and targeted to the scientific or processing behavior being changed
+- if a change cannot reasonably start test-first, add regression coverage immediately after implementing it
+- be explicit about gaps where behavior is hard to test because of legacy structure, optional dependencies, or data availability

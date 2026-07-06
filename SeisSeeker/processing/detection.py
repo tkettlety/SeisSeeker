@@ -17,14 +17,30 @@ import os
 import obspy
 import datetime
 from scipy.signal import find_peaks, hilbert
-from numba import jit, objmode, prange
+try:
+    from numba import jit, objmode, prange
+except ImportError:  # pragma: no cover - exercised indirectly in test envs
+    from contextlib import contextmanager
+
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
+    @contextmanager
+    def objmode(**kwargs):
+        yield
+
+    def prange(*args):
+        return range(*args)
 import gc
 import logging
 
 import time
 import glob
 import pickle
-from SeisSeeker.processing import lookup_table_manager, location
+from SeisSeeker.processing import lookup_table_manager, location, selby
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +67,15 @@ def xy_to_rtheta(x, y):
     except TypeError:
         theta = theta + 360
     return r, theta
+
+
+def _ensure_score_columns(t_series_df):
+    """Backfill generic score columns for legacy detector outputs."""
+    if "score" not in t_series_df.columns:
+        t_series_df["score"] = t_series_df["power"].values
+    if "statistic" not in t_series_df.columns:
+        t_series_df["statistic"] = "beam_power"
+    return t_series_df
 
 
 @jit(nopython=True, parallel=True)
@@ -719,8 +744,16 @@ class setup_detection:
         # self.nproc = 1
         self.out_fnames_array_proc = []
         # For detection:
+        self.detector_type = "mad"
         self.mad_window_length_s = 3600
         self.mad_multiplier = 8
+        self.selby_filter_half_width_hz = 0.75
+        self.selby_filter_step_hz = 0.75
+        self.selby_noise_window_s = 30.0
+        self.selby_f_threshold = 5.0
+        self.selby_f_prominence = None
+        self.selby_freqmin = 0.5
+        self.selby_freqmax = 6.5
         self.min_event_sep_s = 1.0
         self.bazi_tol = 20.0
         self.max_phase_sep_s = 2.5
@@ -735,6 +768,26 @@ class setup_detection:
         # And load existing detection instance, if specified:
         if preload_fname:
             self.load(preload_fname)
+
+    def _detector_suffix(self):
+        """Return filename suffix for the active detector."""
+        if self.detector_type == "selby":
+            return "_selby"
+        return ""
+
+    def _build_outfile_name(self, date, hour, channel_curr):
+        """Build detector-aware output filenames."""
+        suffix = self._detector_suffix()
+        return (
+            f"detection_t_series_{date.year:02d}{date.month:02d}{date.day:02d}_"
+            f"{hour:02d}00_ch{channel_curr[-1]}{suffix}.csv"
+        )
+
+    def _get_active_prefilter_band(self):
+        """Return the prefilter band used during data loading."""
+        if self.detector_type == "selby":
+            return self.selby_freqmin, self.selby_freqmax
+        return self.freqmin, self.freqmax
 
     def run_array_proc(self):
         """Function to run core array processing.
@@ -765,7 +818,7 @@ class setup_detection:
                 for hour in range(24):
                     # Loop over every hour in every day..
                     # Make outfile
-                    outfile = f"detection_t_series_{date.year:02d}{date.month:02d}{date.day:02d}_{hour:02d}00_ch{self.channel_curr[-1]}.csv"
+                    outfile = self._build_outfile_name(date, hour, self.channel_curr)
                     if ((self.outdir / outfile).is_file()) & (self.skip_existing):
                         logger.warning(f"{outfile} exists in {self.outdir}")
                         logger.warning("Move to next hour")
@@ -785,12 +838,27 @@ class setup_detection:
                         continue
 
                     # Create datastores:
-                    data_store = {"t": [], "power": [], "slowness": [], "back_azi": []}
+                    data_store = {
+                        "t": [],
+                        "power": [],
+                        "score": [],
+                        "slowness": [],
+                        "back_azi": [],
+                        "statistic": [],
+                    }
 
                     # Load data:
                     try:
+                        freqmin_override, freqmax_override = (
+                            self._get_active_prefilter_band()
+                        )
                         st = self._load_data(
-                            year=date.year, month=date.month, day=date.day, hour=hour
+                            year=date.year,
+                            month=date.month,
+                            day=date.day,
+                            hour=hour,
+                            freqmin_override=freqmin_override,
+                            freqmax_override=freqmax_override,
                         )
                     except IndexError:
                         # And skip if no data:
@@ -859,14 +927,18 @@ class setup_detection:
                             )
                         time_this_minute_st = st_trimmed[0].stats.starttime
                         # Run array processing:
-                        # (to get power in slowness space)
-                        Psum_all = self._beamforming(st_trimmed)
+                        if self.detector_type == "selby":
+                            score_cube = self._selby_beamforming(st_trimmed)
+                            statistic = "selby_f"
+                        else:
+                            score_cube = self._beamforming(st_trimmed)
+                            statistic = "beam_power"
                         del st_trimmed
                         gc.collect()
 
                         # Calculate time-series outputs (for detection) from data:
                         t_series, powers, slownesses, back_azis = (
-                            self._find_time_series(Psum_all)
+                            self._find_time_series_from_score_cube(score_cube)
                         )
                         # And append to data out:
                         t_series_out = []
@@ -875,11 +947,13 @@ class setup_detection:
 
                         data_store["t"].extend(t_series_out)
                         data_store["power"].extend(powers)
+                        data_store["score"].extend(powers)
                         data_store["slowness"].extend(slownesses)
                         data_store["back_azi"].extend(back_azis)
+                        data_store["statistic"].extend([statistic] * len(powers))
 
                         # And clear memory:
-                        del Psum_all, t_series, powers, slownesses, back_azis
+                        del score_cube, t_series, powers, slownesses, back_azis
                         gc.collect()
 
                     # And save data out:
@@ -978,7 +1052,9 @@ class setup_detection:
         )
         print("=" * 60)
 
-    def _load_data(self, year, month, day, hour=None, norm=True):
+    def _load_data(
+        self, year, month, day, hour=None, norm=True, freqmin_override=None, freqmax_override=None
+    ):
         """
         Function to load data. If no hour is specified the whole day will be read in.
         Otherwise the hour of data will be loaded.
@@ -1030,9 +1106,10 @@ class setup_detection:
         st.detrend("linear")
         st.merge(method=1, fill_value=0.0)
         # And apply filter:
-        if self.freqmin:
-            if self.freqmax:
-                st.filter("bandpass", freqmin=self.freqmin, freqmax=self.freqmax)
+        freqmin_to_use = self.freqmin if freqmin_override is None else freqmin_override
+        freqmax_to_use = self.freqmax if freqmax_override is None else freqmax_override
+        if freqmin_to_use and freqmax_to_use:
+            st.filter("bandpass", freqmin=freqmin_to_use, freqmax=freqmax_to_use)
         # And trim data, if some lies outside start and end time of beamforming period:
         if self.starttime > st[0].stats.starttime:
             st.trim(starttime=self.starttime)
@@ -1075,6 +1152,19 @@ class setup_detection:
                     data[i, j, :] = 0.0
         return data
 
+    def _convert_st_to_station_matrix(self, st):
+        """Convert a trimmed stream to a station x sample matrix."""
+        station_labels = self.stations_df["Name"].values
+        data_len = len(st[0].data)
+        data = np.zeros((len(station_labels), data_len))
+        for idx, station in enumerate(station_labels):
+            traces = st.select(station=station, channel=self.channel_curr)
+            if len(traces) > 0:
+                tr = traces[0]
+                n_copy = min(len(tr.data), data_len)
+                data[idx, :n_copy] = tr.data[:n_copy]
+        return data
+
     def _stack_results(self, Pfreq_all):
         """Function to perform stacking of the results."""
         Psum_all = np.zeros(
@@ -1100,15 +1190,19 @@ class setup_detection:
                     Shape is n_win x slowness WE x slowness SN
         Returns time-series of coherency (power), slowness and back-azimuth.
         """
+        return self._find_time_series_from_score_cube(Psum_all)
+
+    def _find_time_series_from_score_cube(self, score_cube):
+        """Extract detector score, slowness and back-azimuth from a score cube."""
         # Calcualte ux, uy:
-        ur = np.linspace(self.min_sl, self.max_sl, Psum_all.shape[1])
+        ur = np.linspace(self.min_sl, self.max_sl, score_cube.shape[1])
         utheta = np.linspace(
             self.min_baz,
-            self.max_baz - (self.max_baz / Psum_all.shape[2]),
-            Psum_all.shape[2],
+            self.max_baz - (self.max_baz / score_cube.shape[2]),
+            score_cube.shape[2],
         )
         # Create time-series:
-        n_win_curr = Psum_all.shape[0]
+        n_win_curr = score_cube.shape[0]
         t_series = np.arange(
             self.win_step_inc_s / 2,
             (n_win_curr * self.win_step_inc_s) + (self.win_step_inc_s / 2),
@@ -1122,16 +1216,41 @@ class setup_detection:
         back_azis = np.zeros(n_win_curr)
         # Loop over windows in time:
         for i in range(n_win_curr):
-            # Calculate max. power:
-            powers[i] = np.max(np.abs(Psum_all[i, :, :]))
+            powers[i] = np.max(np.abs(score_cube[i, :, :]))
             # Calculate slowness:
-            r_idx = np.where(Psum_all[i, :, :] == Psum_all[i, :, :].max())[0][0]
-            theta_idx = np.where(Psum_all[i, :, :] == Psum_all[i, :, :].max())[1][0]
+            r_idx = np.where(score_cube[i, :, :] == score_cube[i, :, :].max())[0][0]
+            theta_idx = np.where(score_cube[i, :, :] == score_cube[i, :, :].max())[1][0]
             slownesses[i] = ur[r_idx]
             # And calculate back-azimuth:
             back_azis[i] = utheta[theta_idx]
 
         return t_series, powers, slownesses, back_azis
+
+    def _selby_beamforming(self, st_trimmed):
+        """Calculate a Selby-inspired detector score cube for a trimmed stream."""
+        station_matrix = self._convert_st_to_station_matrix(st_trimmed)
+        xx = self.stations_df["x_array_coords_km"].values
+        yy = self.stations_df["y_array_coords_km"].values
+        score_cube, _ = selby.compute_selby_score_cube(
+            station_matrix,
+            st_trimmed[0].stats.sampling_rate,
+            xx,
+            yy,
+            self.min_sl,
+            self.max_sl,
+            self.n_sl,
+            self.min_baz,
+            self.max_baz,
+            self.n_baz,
+            self.win_len_s,
+            self.win_step_inc_s,
+            self.selby_freqmin,
+            self.selby_freqmax,
+            self.selby_filter_step_hz,
+            self.selby_filter_half_width_hz,
+            self.selby_noise_window_s,
+        )
+        return score_cube
 
     def _beamforming(self, st_trimmed, verbosity=0):
         """Function to perform beamforming, given a stream of data for a specific
@@ -1502,11 +1621,18 @@ class setup_detection:
         events_df_all = pd.DataFrame()
         # Loop over array proc outdir data:
         if fnames is None:
+            detector_suffix = self._detector_suffix()
             fnames = glob.glob(
-                os.path.join(self.outdir, "detection_t_series_*_chZ.csv")
+                os.path.join(
+                    self.outdir, f"detection_t_series_*_chZ{detector_suffix}.csv"
+                )
             )
         for fname in sorted(fnames):
-            f_uid = fname[-21:-8]
+            basename = os.path.basename(fname)
+            channel_token = "_chZ"
+            if channel_token not in basename:
+                continue
+            f_uid = basename.split(channel_token)[0].replace("detection_t_series_", "")
             # Check if in list to process:
             if fname in self.out_fnames_array_proc:
                 # And load in data:
@@ -1514,35 +1640,53 @@ class setup_detection:
                 t_series_df_Z = pd.read_csv(
                     fname, converters={"t": lambda x: obspy.UTCDateTime(x)}
                 )
+                t_series_df_Z = _ensure_score_columns(t_series_df_Z)
                 # And read in horizontals:
+                detector_suffix = self._detector_suffix()
                 try:
                     fname_N = os.path.join(
-                        self.outdir, "".join(("detection_t_series_", f_uid, "_chN.csv"))
+                        self.outdir,
+                        "".join(
+                            ("detection_t_series_", f_uid, "_chN", detector_suffix, ".csv")
+                        ),
                     )
                     t_series_df_N = pd.read_csv(
                         fname_N, converters={"t": lambda x: obspy.UTCDateTime(x)}
                     )
+                    t_series_df_N = _ensure_score_columns(t_series_df_N)
                 except FileNotFoundError:
                     fname_N = os.path.join(
-                        self.outdir, "".join(("detection_t_series_", f_uid, "_ch1.csv"))
+                        self.outdir,
+                        "".join(
+                            ("detection_t_series_", f_uid, "_ch1", detector_suffix, ".csv")
+                        ),
                     )
                     t_series_df_N = pd.read_csv(
                         fname_N, converters={"t": lambda x: obspy.UTCDateTime(x)}
                     )
+                    t_series_df_N = _ensure_score_columns(t_series_df_N)
                 try:
                     fname_E = os.path.join(
-                        self.outdir, "".join(("detection_t_series_", f_uid, "_chE.csv"))
+                        self.outdir,
+                        "".join(
+                            ("detection_t_series_", f_uid, "_chE", detector_suffix, ".csv")
+                        ),
                     )
                     t_series_df_E = pd.read_csv(
                         fname_E, converters={"t": lambda x: obspy.UTCDateTime(x)}
                     )
+                    t_series_df_E = _ensure_score_columns(t_series_df_E)
                 except FileNotFoundError:
                     fname_E = os.path.join(
-                        self.outdir, "".join(("detection_t_series_", f_uid, "_ch2.csv"))
+                        self.outdir,
+                        "".join(
+                            ("detection_t_series_", f_uid, "_ch2", detector_suffix, ".csv")
+                        ),
                     )
                     t_series_df_E = pd.read_csv(
                         fname_E, converters={"t": lambda x: obspy.UTCDateTime(x)}
                     )
+                    t_series_df_E = _ensure_score_columns(t_series_df_E)
             else:
                 logger.warning(f"fname {fname} not in fname_array_proc list")
                 logger.warning(
@@ -1586,6 +1730,9 @@ class setup_detection:
             t_series_df_hor["power"] = np.sqrt(
                 t_series_df_N["power"].values ** 2 + t_series_df_E["power"].values ** 2
             )
+            t_series_df_hor["score"] = np.sqrt(
+                t_series_df_N["score"].values ** 2 + t_series_df_E["score"].values ** 2
+            )
             NE_Pxx_max = np.max(
                 np.concatenate(
                     (t_series_df_N["power"].values, t_series_df_E["power"].values)
@@ -1611,39 +1758,61 @@ class setup_detection:
             del N_weighting, E_weighting, t_series_df_N, t_series_df_E
             gc.collect()
 
-            # Calculate pick thresholds:
-            mad_pick_threshold_Z = moving_window_mad(
-                t_series_df_Z["power"].values,
-                self.mad_window_length_s,
-                self.mad_multiplier,
-            )
-
-            mad_pick_threshold_hor = moving_window_mad(
-                t_series_df_hor["power"].values,
-                self.mad_window_length_s,
-                self.mad_multiplier,
-            )
-
             # Get phase picks:
+            if len(t_series_df_Z) < 2:
+                continue
             min_pick_dist = int(
-                self.min_event_sep_s
-                / (
-                    obspy.UTCDateTime(t_series_df_Z["t"][1])
-                    - obspy.UTCDateTime(t_series_df_Z["t"][0])
+                max(
+                    1,
+                    self.min_event_sep_s
+                    / (
+                        obspy.UTCDateTime(t_series_df_Z["t"][1])
+                        - obspy.UTCDateTime(t_series_df_Z["t"][0])
+                    ),
                 )
             )
-            peaks_Z, _ = find_peaks(
-                t_series_df_Z["power"].values,
-                height=mad_pick_threshold_Z,
-                distance=min_pick_dist,
-                prominence=mad_pick_threshold_Z,
-            )
-            peaks_hor, _ = find_peaks(
-                t_series_df_hor["power"].values,
-                height=mad_pick_threshold_hor,
-                distance=min_pick_dist,
-                prominence=mad_pick_threshold_hor,
-            )
+            if self.detector_type == "selby":
+                selby_prominence = (
+                    self.selby_f_threshold
+                    if self.selby_f_prominence is None
+                    else self.selby_f_prominence
+                )
+                peaks_Z, _ = find_peaks(
+                    t_series_df_Z["score"].values,
+                    height=self.selby_f_threshold,
+                    distance=min_pick_dist,
+                    prominence=selby_prominence,
+                )
+                peaks_hor, _ = find_peaks(
+                    t_series_df_hor["score"].values,
+                    height=self.selby_f_threshold,
+                    distance=min_pick_dist,
+                    prominence=selby_prominence,
+                )
+            else:
+                mad_pick_threshold_Z = moving_window_mad(
+                    t_series_df_Z["power"].values,
+                    self.mad_window_length_s,
+                    self.mad_multiplier,
+                )
+
+                mad_pick_threshold_hor = moving_window_mad(
+                    t_series_df_hor["power"].values,
+                    self.mad_window_length_s,
+                    self.mad_multiplier,
+                )
+                peaks_Z, _ = find_peaks(
+                    t_series_df_Z["power"].values,
+                    height=mad_pick_threshold_Z,
+                    distance=min_pick_dist,
+                    prominence=mad_pick_threshold_Z,
+                )
+                peaks_hor, _ = find_peaks(
+                    t_series_df_hor["power"].values,
+                    height=mad_pick_threshold_hor,
+                    distance=min_pick_dist,
+                    prominence=mad_pick_threshold_hor,
+                )
             print(
                 f"Found {len(peaks_Z)} P-phase picks and {len(peaks_hor)} S-phase picks for file with uid {f_uid}"
             )
@@ -1663,6 +1832,11 @@ class setup_detection:
 
             # Find uncertainties (in time, bazi, slowness):
             if self.calc_uncertainties:
+                if self.detector_type == "selby":
+                    raise NotImplementedError(
+                        "Selby-inspired detections do not yet support uncertainty "
+                        "estimation via the legacy beam-power workflow."
+                    )
                 events_df = self._calc_uncertainties(
                     events_df, t_series_df_Z, t_series_df_hor, verbosity=verbosity
                 )
@@ -1900,6 +2074,16 @@ class setup_detection:
         f = open(preload_fname, "rb")
         self.__dict__ = pickle.load(f)
         f.close()
+        self.detector_type = self.__dict__.get("detector_type", "mad")
+        self.selby_filter_half_width_hz = self.__dict__.get(
+            "selby_filter_half_width_hz", 0.75
+        )
+        self.selby_filter_step_hz = self.__dict__.get("selby_filter_step_hz", 0.75)
+        self.selby_noise_window_s = self.__dict__.get("selby_noise_window_s", 30.0)
+        self.selby_f_threshold = self.__dict__.get("selby_f_threshold", 5.0)
+        self.selby_f_prominence = self.__dict__.get("selby_f_prominence", None)
+        self.selby_freqmin = self.__dict__.get("selby_freqmin", 0.5)
+        self.selby_freqmax = self.__dict__.get("selby_freqmax", 6.5)
         print("Loaded detection instance from:", preload_fname)
 
     def get_composite_array_st_from_bazi_slowness(

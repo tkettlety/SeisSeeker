@@ -6,3 +6,4 @@ Submodule for undertaking array processing analysis.
 from .detection import *
 from .location import *
 from .lookup_table_manager import *
+from .selby import *

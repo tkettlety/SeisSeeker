@@ -249,10 +249,17 @@ The notebook in that directory is useful for orientation, but the example archiv
 
 ## Running Tests
 
-The repository now includes a small test suite for the Selby-inspired backend:
+The repository now includes a detector-focused test suite covering both the
+legacy MAD workflow and the Selby-inspired backend:
 
 ```bash
-pytest -q tests/test_selby.py
+pytest -q tests/test_selby.py tests/test_detection_core.py tests/test_detection_setup_and_io.py tests/test_detection_workflows.py
+```
+
+For detector-only coverage reporting:
+
+```bash
+python -m pytest --cov=SeisSeeker.processing.detection --cov=SeisSeeker.processing.selby --cov-report=term-missing -q tests/test_selby.py tests/test_detection_core.py tests/test_detection_setup_and_io.py tests/test_detection_workflows.py
 ```
 
 ## Current Limitations
@@ -268,4 +275,3 @@ pytest -q tests/test_selby.py
 Background documentation for the original array-processing approach is referenced in the project history:
 
 Thomas S. Hudson, Alex M. Brisbourne, Sofia-Katerina Kufner, J-Michael Kendall, and Andy M. Smith, "Array processing in cryoseismology".
-

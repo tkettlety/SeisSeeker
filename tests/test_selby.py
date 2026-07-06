@@ -1,17 +1,4 @@
-import importlib.util
-from pathlib import Path
-
 import numpy as np
-
-
-MODULE_PATH = Path(__file__).resolve().parents[1] / "SeisSeeker" / "processing" / "selby.py"
-SPEC = importlib.util.spec_from_file_location("seisseeker_selby", MODULE_PATH)
-SELBY = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(SELBY)
-
-build_selby_filter_centres = SELBY.build_selby_filter_centres
-compute_selby_score_cube = SELBY.compute_selby_score_cube
-rolling_noise_floor = SELBY.rolling_noise_floor
 
 
 def _shift_signal(signal, dt_s, fs):
@@ -29,14 +16,16 @@ def _make_burst_signal(fs, duration_s, centre_freq_hz):
     return signal
 
 
-def test_build_selby_filter_centres_creates_overlapping_band_centres():
-    centres = build_selby_filter_centres(0.5, 6.5, 0.75, 0.75)
+def test_build_selby_filter_centres_creates_overlapping_band_centres(load_processing_module):
+    selby = load_processing_module("selby")
+    centres = selby.build_selby_filter_centres(0.5, 6.5, 0.75, 0.75)
     assert np.all(centres >= 1.25)
     assert np.all(centres <= 5.75)
     assert len(centres) > 1
 
 
-def test_rolling_noise_floor_uses_trailing_medians():
+def test_rolling_noise_floor_uses_trailing_medians(load_processing_module):
+    selby = load_processing_module("selby")
     powers = np.array(
         [
             [1.0, 3.0],
@@ -45,7 +34,7 @@ def test_rolling_noise_floor_uses_trailing_medians():
             [4.0, 7.0],
         ]
     )
-    noise = rolling_noise_floor(powers, noise_window_len=2)
+    noise = selby.rolling_noise_floor(powers, noise_window_len=2)
     expected = np.array(
         [
             [1.0, 3.0],
@@ -57,7 +46,8 @@ def test_rolling_noise_floor_uses_trailing_medians():
     np.testing.assert_allclose(noise, expected)
 
 
-def test_compute_selby_score_cube_tracks_coherent_arrival():
+def test_compute_selby_score_cube_tracks_coherent_arrival(load_processing_module):
+    selby = load_processing_module("selby")
     fs = 40.0
     duration_s = 8.0
     centre_freq_hz = 5.0
@@ -79,7 +69,7 @@ def test_compute_selby_score_cube_tracks_coherent_arrival():
         data.append(trace)
     data = np.asarray(data)
 
-    score_cube, centres = compute_selby_score_cube(
+    score_cube, centres = selby.compute_selby_score_cube(
         data,
         fs,
         xx,
@@ -110,7 +100,8 @@ def test_compute_selby_score_cube_tracks_coherent_arrival():
     assert np.max(true_track) > np.percentile(score_cube, 90)
 
 
-def test_compute_selby_score_cube_prefers_signal_over_noise():
+def test_compute_selby_score_cube_prefers_signal_over_noise(load_processing_module):
+    selby = load_processing_module("selby")
     fs = 40.0
     xx = np.array([-0.1, 0.1, -0.1, 0.1])
     yy = np.array([-0.1, -0.1, 0.1, 0.1])
@@ -120,7 +111,7 @@ def test_compute_selby_score_cube_prefers_signal_over_noise():
     signal = noise_only.copy()
     signal += np.vstack([_make_burst_signal(fs, 8.0, 4.5)] * 4)
 
-    noise_cube, _ = compute_selby_score_cube(
+    noise_cube, _ = selby.compute_selby_score_cube(
         noise_only,
         fs,
         xx,
@@ -139,7 +130,7 @@ def test_compute_selby_score_cube_prefers_signal_over_noise():
         filter_half_width_hz=0.5,
         noise_window_s=1.5,
     )
-    signal_cube, _ = compute_selby_score_cube(
+    signal_cube, _ = selby.compute_selby_score_cube(
         signal,
         fs,
         xx,
@@ -160,3 +151,46 @@ def test_compute_selby_score_cube_prefers_signal_over_noise():
     )
 
     assert np.max(signal_cube) > np.max(noise_cube)
+
+
+def test_compute_selby_score_cube_returns_empty_for_too_short_input(load_processing_module):
+    selby = load_processing_module("selby")
+    fs = 20.0
+    data = np.ones((3, 10))
+    xx = np.array([0.0, 0.1, -0.1])
+    yy = np.array([0.0, -0.1, 0.1])
+
+    score_cube, centres = selby.compute_selby_score_cube(
+        data,
+        fs,
+        xx,
+        yy,
+        min_sl=0.0,
+        max_sl=0.2,
+        n_sl=5,
+        min_baz=0.0,
+        max_baz=180.0,
+        n_baz=7,
+        win_len_s=1.0,
+        win_step_inc_s=0.5,
+        freqmin=1.0,
+        freqmax=5.0,
+        filter_step_hz=0.5,
+        filter_half_width_hz=0.5,
+        noise_window_s=1.0,
+    )
+
+    assert score_cube.shape == (0, 5, 7)
+    assert centres.size == 0
+
+
+def test_rolling_noise_floor_rejects_non_positive_window_length(load_processing_module):
+    selby = load_processing_module("selby")
+    powers = np.ones((3, 2))
+
+    try:
+        selby.rolling_noise_floor(powers, noise_window_len=0)
+    except ValueError as exc:
+        assert "positive" in str(exc)
+    else:  # pragma: no cover - defensive failure message
+        raise AssertionError("rolling_noise_floor should reject non-positive windows.")
